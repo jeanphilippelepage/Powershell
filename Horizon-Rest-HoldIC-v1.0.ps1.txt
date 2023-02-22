@@ -1,0 +1,313 @@
+<#
+    .SYNOPSIS
+    Utility to configure IC on hold for forensics analysis
+    Holding the desktops attached to a specific user
+
+    .DESCRIPTION
+    Multiple choice to :
+    - Enable the Forensic Role
+    - List the users currently holding ICs
+    - Add a user to hold ICs
+    - Remove a user holding ICs
+
+
+    .EXAMPLE
+    .\Horizon_Rest_Push_Image.ps1 -ConnectionServerURL https://pod1cbr1.loft.lab -Credentials $creds -vCenterURL "https://pod1vcr1.loft.lab" -DataCenterName "Datacenter_Loft" -baseVMName "W21h1-2021-09-08-15-48" -BaseSnapShotName "Demo Snapshot" -DesktopPoolName "Pod01-Pool02"
+
+    .PARAMETER Credential
+    Mandatory: No
+    Type: PSCredential
+    Object with credentials for the connection server with domain\username and password. If not supplied the script will ask for user and password.
+
+    .PARAMETER ConnectionServerURL
+    Mandatory: Yes
+    Default: String
+    URL of the connection server to connect to
+
+
+    .NOTES
+    Minimum required version: VMware Horizon 8 2206
+    Created by: JP Lepage
+    First version: 01-02-2023
+    Changes: 
+
+    .COMPONENT
+    Powershell Core
+#>
+
+[CmdletBinding(DefaultParameterSetName = 'Generic')]
+param (
+    [Parameter(Mandatory=$false,
+    HelpMessage='Credential object as domain\username with password' )]
+    [PSCredential] $Credentials,
+
+    [Parameter(Mandatory=$true,
+    HelpMessage='FQDN of the connectionserver' )]
+    [ValidateNotNullOrEmpty()]
+    [string] $ConnectionServerURL
+
+   )
+
+if($Credentials){
+    $username=($credentials.username).split("\")[1]
+    $domain=($credentials.username).split("\")[0]
+    $password=$credentials.password
+}
+else{
+    $credentials = Get-Credential
+    $username=($credentials.username).split("\")[1]
+    $domain=($credentials.username).split("\")[0]
+    $password=$credentials.password
+}
+
+$BSTR = [System.Runtime.InteropServices.Marshal]::SecureStringToBSTR($password) 
+$UnsecurePassword = [System.Runtime.InteropServices.Marshal]::PtrToStringAuto($BSTR)
+
+
+function Get-HRHeader(){
+    param($accessToken)
+    return @{
+        'Authorization' = 'Bearer ' + $($accessToken.access_token)
+        'Content-Type' = "application/json"
+    }
+}
+function Open-HRConnection(){
+    param(
+        [string] $username,
+        [string] $password,
+        [string] $domain,
+        [string] $url
+    )
+
+    $Credentials = New-Object psobject -Property @{
+        username = $username
+        password = $password
+        domain = $domain
+    }
+    $fullURL = "$ConnectionServerURL/rest/login"
+
+    return invoke-restmethod -Method Post -uri "$ConnectionServerURL/rest/login" -ContentType "application/json" -Body ($Credentials | ConvertTo-Json)
+}
+function Close-HRConnection(){
+    param(
+        $accessToken,
+        $ConnectionServerURL
+    )
+    return Invoke-RestMethod -Method post -uri "$ConnectionServerURL/rest/logout" -ContentType "application/json" -Body ($accessToken | ConvertTo-Json)
+}
+
+
+try{
+    $accessToken = Open-HRConnection -username $username -password $UnsecurePassword -domain $Domain -url $ConnectionServerURL
+}
+catch{
+    throw "Error Connecting: $_"
+}
+
+
+cls
+
+do {
+  do {
+    write-host ""
+    write-host "A - Check Forensics Privileges"
+    write-host "B - Set Forensic Privileges"
+    write-host "C - List Users on hold"
+    write-host "D - Put User on Hold"
+    write-host "E - Release User from Hold"
+    write-host ""
+    write-host "X - Exit"
+    write-host ""
+    write-host -nonewline "Type your choice and press Enter: "
+    $choice = read-host
+    write-host ""
+    $ok = @("A","B","C","D","E","X") -contains $choice
+    if ( -not $ok) { 
+        write-host "Invalid selection"
+        cls
+    }
+  }
+  until ( $ok )
+  switch ( $choice ) {
+
+  "A" {
+    # Check Forensics Role
+    #---------------------
+    write-host "Checking Forensic Role ..."
+    $Roles = Invoke-RestMethod -Method Get -uri "$ConnectionServerURL/rest/config/v1/roles" -ContentType "application/json" -Headers (Get-HRHeader -accessToken $accessToken)
+    $ForensicsGroupID = ($Roles | where-object {$_.privileges -contains "FORENSICS"}).id
+    $ForensicsGroupName = ($Roles | where-object {$_.privileges -contains "FORENSICS"}).name
+    $ForensicsPrivileges = ($Roles | where-object {$_.privileges -contains "FORENSICS"}).privileges -join ';'
+    Write-Output("GroupID = $ForensicsGroupID")
+    Write-Output("Name = $ForensicsGroupName")
+    Write-Output("Privileges = $ForensicsPrivileges")
+    read-host("type a key")
+    cls
+    break
+    }
+  
+  
+   "B" {
+    # Set Forensics Privileges"
+    #---------------------
+    write-host "Set Forensic Privileges ..."
+    
+    $body = @{ 
+        "description" = "Forensic Administrator role."
+        "name"= "Forensic Admin"
+        "privileges" = @(
+            "FORENSICS",
+            "MACHINE_MANAGEMENT")
+    }
+    try {
+             $return = Invoke-RestMethod -Method Post -uri "$ConnectionServerURL/rest/config/v1/roles"  -ContentType "application/json" -Headers (Get-HRHeader -accessToken $accessToken) -Body ($body | ConvertTo-Json)
+    }
+    catch {
+        $exception = $_.exception
+        Write-Host "Error" $_.Exception
+        Write-Host "StatusDescription:" $_.Exception.Response.StatusDescription
+    }
+
+
+    read-host("type a key")    
+    cls
+    break 
+    }
+  
+  
+   "C" {
+    # List Users on hold
+    #---------------------
+    write-host "List Users on hold..."
+
+   try {
+             $groups = Invoke-RestMethod -Method Get -uri "$ConnectionServerURL/rest/external/v1/ad-users-or-groups/held-users-or-groups"  -ContentType "application/json" -Headers (Get-HRHeader -accessToken $accessToken) 
+    }
+    catch {
+        $exception = $_.exception
+        Write-Host "Error" $_.Exception
+        Write-Host "StatusDescription:" $_.Exception.Response.StatusDescription
+    }
+
+    $groups | ForEach-Object {
+         $sid = $_.ad_user_or_group_id
+         $obj = get-adUser -Identity $sid
+         write-host $obj.name
+         }
+
+
+    read-host("type a key")
+    cls
+    break
+    }
+  
+  
+   "D" {
+    # Put User on Hold
+    #---------------------
+    write-host "Putting User on Hold ..."
+
+    # Get User ID
+    #------------
+    write-host "Enter the first letters of a name (group or user):"
+    $ADName = read-host
+
+
+    $HoldUsers =get-adObject -Filter "(samaccountname -like '$ADName*') -and (((objectClass -eq 'user') -and (ObjectCategory -eq 'user')) -or (objectClass -eq 'group'))" -Properties Objectsid
+    write-host "Putting these users/groups on hold ?"
+
+    for ($i = 0; $i -lt $HoldUsers.count; $i++) {
+        write-host ($i+1) " : " $HoldUsers[$i].name
+    }
+
+
+    $confirm = read-host "Confirm - enter index or A (All) - other key to quit"
+    if ($confirm -ieq 'A')
+    {
+        [array]$ConfirmedHoldUsers = $HoldUsers
+    }
+    elseif (($confirm -match "^\d+$") -and ($confirm -ge 1) -and ($confirm -le $HoldUsers.count))
+    {
+        [array]$ConfirmedHoldUsers = $HoldUsers | where-object -FilterScript { $_.ObjectGUID -EQ $HoldUsers[($confirm-1)].ObjectGUID }
+    }
+    else
+    {
+        cls
+        break
+    }
+
+    for ($i = 0; $i -lt $ConfirmedHoldUsers.count; $i++) {
+        write-host "Holding User " $ConfirmedHoldUsers[$i].name
+        $jsonBody =  "["""+$ConfirmedHoldUsers[$i].Objectsid+ """]"
+        $return = Invoke-RestMethod -Method Post -uri "$ConnectionServerURL/rest/external/v1/ad-users-or-groups/action/hold" -ContentType "application/json" -Headers (Get-HRHeader -accessToken $accessToken) -body $jsonBody
+        Write-Output("Server Response = " + $return.status_code)
+        Write-Output("Server Error =" + $return.errors.error_message)
+    }
+
+    read-host("type a key")
+    cls
+    break
+    }
+
+
+  "E" {
+    # Release User from Hold
+    #---------------------
+    write-host "Release User on Hold ..."
+
+    $HoldUsers = @()
+
+   # List users on hold
+   try {
+             $HoldUsersSIDs = Invoke-RestMethod -Method Get -uri "$ConnectionServerURL/rest/external/v1/ad-users-or-groups/held-users-or-groups"  -ContentType "application/json" -Headers (Get-HRHeader -accessToken $accessToken) 
+    }
+    catch {
+        $exception = $_.exception
+        Write-Host "Error" $_.Exception
+        Write-Host "StatusDescription:" $_.Exception.Response.StatusDescription
+    }
+
+    for ($i = 0; $i -lt $HoldUsersSIDs.count; $i++) {
+        $HoldUser = get-adUser -Identity $HoldUsersSIDs[$i].ad_user_or_group_id
+        write-host ($i+1) " : " $HoldUser.name
+        [array]$HoldUsers += $HoldUser
+    }
+
+
+    $confirm = read-host "Enter number or A for All - other key to escape"
+
+    if ($confirm -ieq 'A')
+    {
+        write-host "Releasing clones for All users"
+        [array]$ReleaseHoldUsers = $HoldUsers
+    }
+    elseif (($confirm -match "^\d+$") -and ($confirm -ge 1) -and ($confirm -le $HoldUsers.count))
+    {
+        write-host "Releasing Clones for user/group : " $HoldUsers[($confirm-1)].name
+        [array]$ReleaseHoldUsers = $HoldUsers | where-object -FilterScript { $_.ObjectGUID -EQ $HoldUsers[($confirm-1)].ObjectGUID }
+    }
+    else
+    {
+        cls
+        break
+    }
+
+    # write json body
+    $jsonBody =  "["
+    $list = $ReleaseHoldUsers | Select-Object -ExpandProperty SID
+    $jsonbody += '"{0}"' -f ($list -join '","')    
+    $jsonBody += "]"
+
+    $return = Invoke-RestMethod -Method Post -uri "$ConnectionServerURL/rest/external/v1/ad-users-or-groups/action/release-hold" -ContentType "application/json" -Headers (Get-HRHeader -accessToken $accessToken) -body $jsonBody
+    Write-host("Server Response = " + $return.status_code)
+    Write-host("Server Error =" + $return.errors.error_message)
+
+
+    read-host("type a key")
+    cls
+    break
+    }
+
+  }
+}
+until ( $choice -eq "X" )
